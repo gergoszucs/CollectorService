@@ -1,66 +1,102 @@
 ﻿using System;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Threading;
 
 namespace CollectorService
 {
     class Collector
     {
-        //private static readonly HttpClient client = new HttpClient();
-        Provider provider;
+        private static readonly int maxThreads, pollingTime;
+        private static readonly string restProviderUrl;
+        private int activeThreads;
+
+        static Collector()
+        {
+            restProviderUrl = "http://autoscaleproducer.azurewebsites.net";
+            maxThreads = 10; // Number of maximum concurrent threads
+            pollingTime = 1000; // Time in milliseconds, the main polling thread should wait after a unsuccessful GET request
+        }
 
         public Collector()
         {
-            provider = new Provider();
-            // Set max threads to 10 for the ThreadPool and let it handle the management
-            // and reuse of individual threads
-            ThreadPool.SetMaxThreads(11, 11);
             // Start the 'main' thread which will poll the provider regardless of the existence of data
-            (new Thread(() => { CollectData(); })).Start();
+            activeThreads = 1;
+            (new Thread(() => { PollProvider(); })).Start();
         }
 
-        private void CollectData()
+        private void PollProvider()
         {
             // Kind of a master process, checks if there is anything to read,
             // if so, it will spawn a child to help with the data processing
             while (true)
             {
-                int result = provider.Get();
-                PrintThreadInfo();
-                if (result == 0)
+                string result = GetMeasurementData();
+
+                if (!result.Equals(String.Empty))
                 {
-                    Console.WriteLine("MainProcess is sleeping, no data found");
-                    Thread.Sleep(10000);
+                    SpawnHelper();
+                    Console.WriteLine(result);
+                    Thread.Sleep(Int32.Parse(result));
                 }
                 else
                 {
-                    Console.WriteLine("MainProcess spawns a child");
-                    ThreadPool.QueueUserWorkItem(GetData);
-                    Thread.Sleep(result);
+                    Thread.Sleep(pollingTime);
                 }
             }
         }
 
-        private void GetData(object stateInfo)
+        private void SpawnHelper()
         {
-            Console.WriteLine("Reading data from provider");
-            PrintThreadInfo();
-            int result = provider.Get();
-            // Child calls for additional help if there is more data to read
-            if(result != 0)
+            if(activeThreads < maxThreads)
             {
-                Console.WriteLine("Child spawns a child");
-                ThreadPool.QueueUserWorkItem(GetData);
-                Thread.Sleep(result);
+                Console.WriteLine("New thread started, active threads: " + ++activeThreads);
+                (new Thread(() => { PollUntilFailure(); })).Start();
             }
         }
 
-        private void PrintThreadInfo()
+        private void PollUntilFailure()
         {
-            int max, available;
-            ThreadPool.GetMaxThreads(out max, out _);
-            ThreadPool.GetAvailableThreads(out available, out _);
+            string result;
 
-            Console.WriteLine("Max = " + max + ", Available = " + available + ", Running = " + (max - available));
+            do
+            {
+                // As we should not know if there is more than one data, the spawned child process
+                // will always try to read at least once, instead of relying on the queue length
+                // from the HTTP header
+                result = GetMeasurementData();
+
+                if (!result.Equals(String.Empty))
+                {
+                    // Helpers will also spawn additional threads if needed (while also being under the limit)
+                    SpawnHelper();
+                    Console.WriteLine(result);
+                    Thread.Sleep(Int32.Parse(result));
+                }
+            }
+            while (!result.Equals(String.Empty));
+
+            Console.WriteLine("Thread suspended, active threads: " + --activeThreads);
+        }
+
+        private string GetMeasurementData()
+        {
+            using (var client = new HttpClient(new HttpClientHandler { AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate }))
+            {
+                client.BaseAddress = new Uri(restProviderUrl);
+                HttpResponseMessage response = client.GetAsync("/api/meter").Result;
+
+                if(response.StatusCode.Equals(HttpStatusCode.OK))
+                {
+                    Console.WriteLine("Queue Length: " + response.Headers.ToDictionary(l => l.Key, k => k.Value)["QueueLength"].First());
+                    return response.Content.ReadAsStringAsync().Result;
+                }
+                else
+                {
+                    return String.Empty;
+                }
+            }
         }
     }
 }

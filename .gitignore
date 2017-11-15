@@ -1,0 +1,4 @@
+/.vs
+CollectorService/bin/*
+CollectorService/obj/*
+packages/*
